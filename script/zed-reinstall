@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Resolve through the symlink in ~/.local/bin so the repo root is found
+# regardless of how this script was invoked.
+script_path=$(readlink -f "${BASH_SOURCE[0]}")
+
+REPO="${ZED_REPO:-$(cd "$(dirname "$script_path")/.." && pwd)}"
+APP="${ZED_APP:-/Applications/Zed.app}"
+PROFILE="${ZED_PROFILE:-release-fast}"
+TARGET_TRIPLE="aarch64-apple-darwin"
+BUILD_DIR="target/${TARGET_TRIPLE}/${PROFILE}"
+
+cd "$REPO"
+
+# ZED_BUNDLE is read via option_env! at compile time; without it the binary
+# ignores the git shipped in Contents/MacOS and falls back to system git.
+ZED_BUNDLE=true CARGO_INCREMENTAL=1 \
+    cargo build --profile "$PROFILE" --package zed --package cli --target "$TARGET_TRIPLE"
+
+app_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$APP/Contents/Info.plist")
+if pgrep -f "$APP/Contents/MacOS/zed" >/dev/null; then
+    echo "Quitting $app_name"
+    osascript -e "quit app \"$app_name\"" >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+        pgrep -f "$APP/Contents/MacOS/zed" >/dev/null || break
+        sleep 1
+    done
+    if pgrep -f "$APP/Contents/MacOS/zed" >/dev/null; then
+        echo "error: $app_name did not quit" >&2
+        exit 1
+    fi
+fi
+
+echo "Installing binaries into $APP"
+cp "$BUILD_DIR/zed" "$BUILD_DIR/cli" "$APP/Contents/MacOS/"
+
+# Replacing the binaries invalidates the sealed hashes in _CodeSignature,
+# so the bundle must be signed again or macOS refuses to launch it.
+codesign --force --deep \
+    --entitlements "$APP/Contents/Resources/zed.entitlements" \
+    --sign - "$APP" >/dev/null
+
+echo "Launching $APP"
+open -a "$APP"
