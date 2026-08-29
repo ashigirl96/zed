@@ -6201,6 +6201,11 @@ impl ProjectPanel {
                             });
                             return;
                         }
+                        if event.click_count() < 2 && !event.is_keyboard() {
+                            project_panel.selection = Some(selection);
+                            cx.notify();
+                            return;
+                        }
                         if event.modifiers().alt {
                             project_panel.toggle_expand_all(entry_id, window, cx);
                         } else {

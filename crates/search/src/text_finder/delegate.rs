@@ -29,11 +29,10 @@ use std::{ops::Range, time::Duration};
 
 use collections::{HashMap, HashSet};
 use editor::{Editor, MultiBufferSnapshot, PathKey, multibuffer_context_lines};
-use file_icons::FileIcons;
 use futures::StreamExt;
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, ClickEvent, DismissEvent, EntityId, HighlightStyle,
-    Modifiers, StyledText, Task, TextStyle, prelude::*,
+    AnyElement, App, AppContext, AsyncApp, DismissEvent, EntityId, HighlightStyle, StyledText,
+    Task, TextStyle, prelude::*,
 };
 use gpui::{Entity, FocusHandle, WeakEntity};
 use language::{Buffer, Language, LanguageAwareStyling};
@@ -44,32 +43,22 @@ use settings::Settings;
 use smol::future::yield_now;
 use text::Anchor;
 use theme_settings::ThemeSettings;
-use ui::{
-    Disclosure, Divider, FluentBuilder, ListItem, ListItemSpacing, Toggleable, Tooltip, prelude::*,
-    text_for_keystroke,
-};
+use ui::{Divider, FluentBuilder, ListItem, ListItemSpacing, Toggleable, Tooltip, prelude::*};
 use util::ResultExt;
 use workspace::SplitDirection;
 use workspace::Workspace;
-use workspace::item::ItemSettings;
 use workspace::pane::Pane;
 
-use super::{Fold, SearchMatch, Unfold};
+use super::SearchMatch;
 use crate::project_search::{ActiveSettings, ProjectSearch};
 use crate::{ProjectSearchView, SearchOption, SearchOptions};
 
 pub struct Delegate {
     pub(crate) project_search_view: Entity<ProjectSearchView>,
     pub(crate) focus_handle: FocusHandle,
-    /// Flat list of every match, in result order. This is the canonical list
-    /// handed off to the project search; [`Self::entries`] is a grouped view
-    /// derived from it for rendering.
+    /// Every match, in result order. One row is rendered per match, so
+    /// `selected_index` indexes directly into this list.
     pub(crate) matches: Vec<SearchMatch>,
-    /// Display rows derived from [`Self::matches`]: a non-selectable header per
-    /// file, its matches, and separators between groups. Rebuilt via
-    /// [`Delegate::rebuild_entries`] whenever `matches` changes. `selected_index`
-    /// indexes into this list.
-    pub(crate) entries: Vec<Entry>,
     pub(crate) selected_index: usize,
     pub(crate) cancel_flag: Arc<AtomicBool>,
     pub(crate) text_finder_turning_into_project_search: Arc<AtomicBool>,
@@ -82,12 +71,14 @@ pub struct Delegate {
     /// When `is_ready` there is not a search in progress
     pub(crate) in_progress_search: InProgressSearch,
     pub(crate) unique_files: HashSet<ProjectPath>,
+    /// Set when the search hit [`Search::MAX_SEARCH_RESULT_RANGES`], so the
+    /// counts are reported as lower bounds rather than totals.
+    pub(crate) results_capped: bool,
     /// Largest line number across [`Self::matches`], used to size the line-number
     /// column so every row's number right-aligns to the widest one. Recomputed in
-    /// [`Delegate::rebuild_entries`].
+    /// [`Delegate::on_matches_changed`].
     pub(crate) max_line_number: u32,
     pub(crate) selected_matches: Vec<SelectedMatch>,
-    pub(crate) collapsed_paths: HashSet<ProjectPath>,
     pub(crate) query_editor: Option<Entity<Editor>>,
     pub(crate) regex_language: Option<Arc<Language>>,
 }
@@ -108,12 +99,6 @@ impl PartialEq<SearchMatch> for SelectedMatch {
     fn eq(&self, other: &SearchMatch) -> bool {
         self.0.path == other.path && self.0.range == other.range
     }
-}
-
-pub(crate) enum Entry {
-    Header(ProjectPath),
-    Match(usize),
-    Separator,
 }
 
 async fn get_ongoing_search(
@@ -204,7 +189,7 @@ async fn stream_plunder_to_picker(
                 .unique_files
                 .extend(new_matches.iter().map(|m| m.path.clone()));
             delegate.matches.extend(new_matches);
-            delegate.rebuild_entries();
+            delegate.on_matches_changed();
             cx.notify();
             ControlFlow::Continue(())
         });
@@ -315,7 +300,6 @@ impl Delegate {
                 project_search_view: project_search,
                 focus_handle: cx.focus_handle(),
                 matches: Vec::new(),
-                entries: Vec::new(),
                 selected_index: 0,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 text_finder_turning_into_project_search: Arc::new(AtomicBool::new(false)),
@@ -326,9 +310,9 @@ impl Delegate {
                 imported_from_project_search,
                 in_progress_search,
                 unique_files: HashSet::default(),
+                results_capped: false,
                 max_line_number: 0,
                 selected_matches: Vec::new(),
-                collapsed_paths: HashSet::default(),
                 query_editor: None,
                 regex_language: None,
             });
@@ -360,34 +344,11 @@ impl Delegate {
         &self.project_search_view.read(cx).entity.read(cx).project
     }
 
-    /// Rebuilds the grouped [`Self::entries`] display list from the flat
-    /// [`Self::matches`]. Matches arrive grouped per file (one search result
-    /// per buffer), so consecutive matches share a path; we emit one header per
-    /// group and a separator before every group after the first.
-    ///
-    /// Selection is preserved across rebuilds: if a match was selected it stays
-    /// selected at its new row, otherwise we snap to the first selectable row.
-    pub(crate) fn rebuild_entries(&mut self) {
-        let previously_selected_match = match self.entries.get(self.selected_index) {
-            Some(Entry::Match(match_index)) => Some(*match_index),
-            _ => None,
-        };
-
-        let mut entries = Vec::with_capacity(self.matches.len());
-        let mut last_path: Option<&ProjectPath> = None;
-        for (match_index, search_match) in self.matches.iter().enumerate() {
-            if last_path != Some(&search_match.path) {
-                if last_path.is_some() {
-                    entries.push(Entry::Separator);
-                }
-                entries.push(Entry::Header(search_match.path.clone()));
-                last_path = Some(&search_match.path);
-            }
-            if !self.collapsed_paths.contains(&search_match.path) {
-                entries.push(Entry::Match(match_index));
-            }
-        }
-        self.entries = entries;
+    /// Recomputes the derived state that depends on [`Self::matches`] and keeps
+    /// the selection in range. Because rows map one-to-one onto matches, a
+    /// selected match keeps its row for free; only a shrinking result set needs
+    /// the selection clamped.
+    pub(crate) fn on_matches_changed(&mut self) {
         self.max_line_number = self
             .matches
             .iter()
@@ -395,79 +356,9 @@ impl Delegate {
             .max()
             .unwrap_or(0);
 
-        self.selected_index = previously_selected_match
-            .and_then(|match_index| {
-                self.entries
-                    .iter()
-                    .position(|entry| matches!(entry, Entry::Match(other) if *other == match_index))
-            })
-            .or_else(|| self.first_selectable_index())
-            .unwrap_or(0);
-    }
-
-    fn first_selectable_index(&self) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|entry| matches!(entry, Entry::Match(_)))
-    }
-
-    pub(crate) fn toggle_group_collapsed(&mut self, path: &ProjectPath) {
-        if !self.collapsed_paths.remove(path) {
-            self.collapsed_paths.insert(path.clone());
-        }
-        self.rebuild_entries();
-    }
-
-    pub(crate) fn set_selected_group_collapsed(
-        &mut self,
-        collapsed: bool,
-        cx: &mut Context<Picker<Self>>,
-    ) {
-        let path = match self.entries.get(self.selected_index) {
-            Some(Entry::Match(match_index)) => self
-                .matches
-                .get(*match_index)
-                .map(|search_match| search_match.path.clone()),
-            Some(Entry::Header(path)) => Some(path.clone()),
-            Some(Entry::Separator) | None => None,
-        };
-        let Some(path) = path else {
-            return;
-        };
-        if collapsed == self.collapsed_paths.contains(&path) {
-            return;
-        }
-
-        self.toggle_group_collapsed(&path);
-
-        if let Some(index) = self.entries.iter().position(|entry| match entry {
-            Entry::Header(header_path) => collapsed && *header_path == path,
-            Entry::Match(match_index) => {
-                !collapsed
-                    && self
-                        .matches
-                        .get(*match_index)
-                        .is_some_and(|search_match| search_match.path == path)
-            }
-            Entry::Separator => false,
-        }) {
-            self.selected_index = index;
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn toggle_all_collapsed(&mut self, cx: &mut Context<Picker<Self>>) {
-        if self.collapsed_paths.is_empty() {
-            self.collapsed_paths = self
-                .matches
-                .iter()
-                .map(|search_match| search_match.path.clone())
-                .collect();
-        } else {
-            self.collapsed_paths.clear();
-        }
-        self.rebuild_entries();
-        cx.notify();
+        self.selected_index = self
+            .selected_index
+            .min(self.matches.len().saturating_sub(1));
     }
 
     fn selected_search_match(&self) -> Option<&SearchMatch> {
@@ -475,10 +366,7 @@ impl Delegate {
     }
 
     fn search_match_for_entry(&self, ix: usize) -> Option<&SearchMatch> {
-        match self.entries.get(ix)? {
-            Entry::Match(match_index) => self.matches.get(*match_index),
-            Entry::Header(_) | Entry::Separator => None,
-        }
+        self.matches.get(ix)
     }
 
     pub(crate) fn prepend_selected_matches(&mut self) {
@@ -816,15 +704,45 @@ impl PickerDelegate for Delegate {
     }
 
     fn match_count(&self) -> usize {
-        self.entries.len()
+        self.matches.len()
+    }
+
+    fn render_header(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        let match_count = self.matches.len();
+        if match_count == 0 {
+            return None;
+        }
+        let file_count = self.unique_files.len();
+        // The cap truncates the result stream mid-search, so both counts are
+        // floors once it is hit.
+        let more = if self.results_capped { "+" } else { "" };
+        let summary = format!(
+            "{match_count}{more} {} in {file_count}{more} {}",
+            if match_count == 1 { "match" } else { "matches" },
+            if file_count == 1 { "file" } else { "files" },
+        );
+
+        Some(
+            h_flex()
+                .flex_none()
+                .w_full()
+                .px_2p5()
+                .py_1()
+                .child(
+                    Label::new(summary)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        )
     }
 
     fn can_select(&self, ix: usize, _window: &mut Window, _cx: &mut Context<Picker<Self>>) -> bool {
-        match self.entries.get(ix) {
-            Some(Entry::Match(_)) => true,
-            Some(Entry::Header(path)) => self.collapsed_paths.contains(path),
-            Some(Entry::Separator) | None => false,
-        }
+        ix < self.matches.len()
     }
 
     fn selected_index(&self) -> usize {
@@ -870,13 +788,12 @@ impl PickerDelegate for Delegate {
                 return Task::ready(());
             }
             self.matches.clear();
-            self.entries.clear();
             self.unique_files.clear();
-            self.collapsed_paths.clear();
+            self.results_capped = false;
             self.selected_index = 0;
             self.active_query = None;
             self.prepend_selected_matches();
-            self.rebuild_entries();
+            self.on_matches_changed();
             cx.notify();
             return Task::ready(());
         };
@@ -977,7 +894,6 @@ impl PickerDelegate for Delegate {
         _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        // Headers and separators cannot participate in multi-selection.
         let Some(search_match) = self.search_match_for_entry(ix).cloned() else {
             return;
         };
@@ -1024,6 +940,10 @@ impl PickerDelegate for Delegate {
         cx.emit(DismissEvent);
     }
 
+    fn default_preview_layout(&self) -> picker::PreviewLayout {
+        picker::PreviewLayout::Below
+    }
+
     fn try_get_preview_data_for_match(&self, _cx: &App) -> Option<picker::PreviewUpdate> {
         let m = self.selected_search_match()?;
         Some(picker::PreviewUpdate::from_buffer(
@@ -1066,103 +986,49 @@ impl Delegate {
         _: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
-        match self.entries.get(ix)? {
-            Entry::Separator => Some(
-                div()
-                    .py(DynamicSpacing::Base04.rems(cx))
-                    .child(Divider::horizontal())
-                    .into_any_element(),
-            ),
-            Entry::Header(path) => {
-                let path_style = self.project(cx).read(cx).path_style(cx);
-                let file_name = path
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string())
-                    .unwrap_or_default();
-                let directory = path
-                    .path
-                    .parent()
-                    .map(|parent| parent.display(path_style))
-                    .map(SharedString::new)
-                    .unwrap_or_default();
-                let file_icon = ItemSettings::get_global(cx)
-                    .file_icons
-                    .then(|| FileIcons::get_icon(path.path.as_std_path(), cx))
-                    .flatten()
-                    .map(|icon| {
-                        Icon::from_path(icon)
-                            .color(Color::Muted)
-                            .size(IconSize::Small)
-                    });
-                let is_collapsed = self.collapsed_paths.contains(path);
-                let toggle_path = path.clone();
-                let tooltip_focus_handle = self.focus_handle.clone();
+        let search_match = self.matches.get(ix)?;
+        let path_style = self.project(cx).read(cx).path_style(cx);
+        let file_name = search_match
+            .path
+            .path
+            .file_name()
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        let directory = search_match
+            .path
+            .path
+            .parent()
+            .map(|parent| parent.display(path_style))
+            .map(SharedString::new)
+            .unwrap_or_default();
 
-                Some(
-                    div()
-                        .px_1()
+        Some(
+            ListItem::new(ix)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .when_some(checkbox, |this, checkbox| this.start_slot(checkbox))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_4()
+                        .text_sm()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(render_matched_line(search_match, cx)),
+                        )
                         .child(
                             h_flex()
-                                .w_full()
-                                .min_w_0()
-                                .p_1()
+                                .flex_none()
                                 .gap_1p5()
-                                .rounded_sm()
-                                .when(selected, |this| {
-                                    this.bg(cx.theme().colors().ghost_element_selected)
-                                })
                                 .child(
                                     h_flex()
+                                        .min_w_0()
+                                        .max_w(rems(16.))
                                         .gap_1()
-                                        .child(
-                                            Disclosure::new(
-                                                ("text-finder-fold", ix),
-                                                !is_collapsed,
-                                            )
-                                            .tooltip(move |_window, cx| {
-                                                let (label, action): (_, &dyn gpui::Action) =
-                                                    if is_collapsed {
-                                                        ("Unfold", &Unfold)
-                                                    } else {
-                                                        ("Fold", &Fold)
-                                                    };
-                                                Tooltip::with_meta_in(
-                                                    label,
-                                                    Some(action),
-                                                    format!(
-                                                        "{} to toggle all",
-                                                        text_for_keystroke(
-                                                            &Modifiers::alt(),
-                                                            "click",
-                                                            cx
-                                                        )
-                                                    ),
-                                                    &tooltip_focus_handle,
-                                                    cx,
-                                                )
-                                            })
-                                            .on_click(
-                                                cx.listener(
-                                                    move |this, event: &ClickEvent, _window, cx| {
-                                                        if event.modifiers().alt {
-                                                            this.delegate.toggle_all_collapsed(cx);
-                                                        } else {
-                                                            this.delegate.toggle_group_collapsed(
-                                                                &toggle_path,
-                                                            );
-                                                            cx.notify();
-                                                        }
-                                                    },
-                                                ),
-                                            ),
-                                        )
-                                        .children(file_icon),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .child(Label::new(file_name).size(LabelSize::Small))
                                         .when(!directory.is_empty(), |this| {
                                             this.child(
                                                 Label::new(directory)
@@ -1170,26 +1036,13 @@ impl Delegate {
                                                     .color(Color::Muted)
                                                     .truncate_start(),
                                             )
-                                        }),
-                                ),
-                        )
-                        .into_any_element(),
-                )
-            }
-            Entry::Match(match_index) => {
-                let search_match = self.matches.get(*match_index)?;
-                Some(
-                    ListItem::new(ix)
-                        .spacing(ListItemSpacing::Sparse)
-                        .inset(true)
-                        .toggle_state(selected)
-                        .when_some(checkbox, |this, checkbox| this.start_slot(checkbox))
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .min_w_0()
-                                .gap_2p5()
-                                .text_sm()
+                                        })
+                                        .child(
+                                            Label::new(file_name)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
                                 .child(
                                     h_flex()
                                         .w(rems(
@@ -1197,25 +1050,17 @@ impl Delegate {
                                         ))
                                         .justify_end()
                                         .child(
-                                            Label::new(search_match.line_number.to_string()).color(
-                                                Color::Custom(
+                                            Label::new(search_match.line_number.to_string())
+                                                .size(LabelSize::Small)
+                                                .color(Color::Custom(
                                                     cx.theme().colors().text_muted.opacity(0.5),
-                                                ),
-                                            ),
+                                                )),
                                         ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .child(render_matched_line(search_match, cx)),
                                 ),
-                        )
-                        .into_any_element(),
+                        ),
                 )
-            }
-        }
+                .into_any_element(),
+        )
     }
 }
 
@@ -1280,21 +1125,20 @@ async fn stream_results_to_picker(
 
                 if clear_existing {
                     delegate.matches.clear();
-                    delegate.entries.clear();
                     delegate.unique_files.clear();
-                    delegate.collapsed_paths.clear();
+                    delegate.results_capped = false;
                     delegate.selected_index = 0;
                     clear_existing = false;
                 }
+
+                delegate.results_capped |= limit_reached;
 
                 delegate
                     .unique_files
                     .extend(batch_matches.iter().map(|m| &m.path).cloned());
                 delegate.matches.extend(batch_matches);
                 delegate.prepend_selected_matches();
-                // Rebuild the grouped view and resnap the selection onto a
-                // selectable row (the header/separator rows are not selectable).
-                delegate.rebuild_entries();
+                delegate.on_matches_changed();
 
                 cx.notify();
             })

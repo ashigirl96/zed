@@ -20,14 +20,14 @@ ZED_BUNDLE=true CARGO_INCREMENTAL=1 \
     cargo build --profile "$PROFILE" --package zed --package cli --target "$TARGET_TRIPLE"
 
 app_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$APP/Contents/Info.plist")
-if pgrep -f "$APP/Contents/MacOS/zed" >/dev/null; then
+if pgrep -f "^$APP/Contents/MacOS/zed" >/dev/null; then
     echo "Quitting $app_name"
     osascript -e "quit app \"$app_name\"" >/dev/null 2>&1 || true
     for _ in $(seq 1 30); do
-        pgrep -f "$APP/Contents/MacOS/zed" >/dev/null || break
+        pgrep -f "^$APP/Contents/MacOS/zed" >/dev/null || break
         sleep 1
     done
-    if pgrep -f "$APP/Contents/MacOS/zed" >/dev/null; then
+    if pgrep -f "^$APP/Contents/MacOS/zed" >/dev/null; then
         echo "error: $app_name did not quit" >&2
         exit 1
     fi
