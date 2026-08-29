@@ -26,7 +26,7 @@ use util::ResultExt as _;
 
 use crate::{ProjectSearchView, SearchOptions, text_finder::delegate::PopulateProjectSearch};
 
-actions!(text_finder, [ToProjectSearch, Fold, Unfold, ToggleFoldAll]);
+actions!(text_finder, [ToProjectSearch]);
 
 pub struct TextFinder {
     picker: Entity<Picker<Delegate>>,
@@ -258,24 +258,6 @@ impl TextFinder {
         self.open_in_split(workspace::SplitDirection::Down, window, cx);
     }
 
-    fn fold(&mut self, _: &Fold, _window: &mut Window, cx: &mut Context<Self>) {
-        self.picker.update(cx, |picker, cx| {
-            picker.delegate.set_selected_group_collapsed(true, cx);
-        });
-    }
-
-    fn unfold(&mut self, _: &Unfold, _window: &mut Window, cx: &mut Context<Self>) {
-        self.picker.update(cx, |picker, cx| {
-            picker.delegate.set_selected_group_collapsed(false, cx);
-        });
-    }
-
-    fn toggle_fold_all(&mut self, _: &ToggleFoldAll, _window: &mut Window, cx: &mut Context<Self>) {
-        self.picker.update(cx, |picker, cx| {
-            picker.delegate.toggle_all_collapsed(cx);
-        });
-    }
-
     fn open_in_split(
         &mut self,
         direction: workspace::SplitDirection,
@@ -422,7 +404,7 @@ impl TextFinder {
     ) -> Self {
         let project = delegate.project(cx).clone();
         let languages = project.read(cx).languages().clone();
-        let preview = picker_preview::editor_preview(project, window, cx);
+        let preview = picker_preview::editor_preview_with_path_header(project, window, cx);
         let query_editor = cx.new(|cx| Editor::single_line(window, cx));
         let erased_query_editor = query_editor.update(cx, |editor, cx| editor.erased(cx));
         let picker = cx.new(|cx| {
@@ -731,6 +713,42 @@ mod tests {
                 None,
                 "highlighting should be dropped once the regex filter is off"
             );
+        });
+    }
+
+    /// The finder is meant to open with the match previewed underneath the
+    /// results, the way JetBrains' Find in Files does.
+    #[gpui::test]
+    async fn test_preview_opens_below_by_default(cx: &mut TestAppContext) {
+        use picker::PreviewLayout;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/dir"), json!({"one.rs": "const ONE: usize = 1;"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        workspace
+            .update_in(cx, |_, window, cx| TextFinder::open(None, window, cx))
+            .await;
+
+        let finder_picker = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<TextFinder>(cx)
+                .expect("text finder should be open")
+                .read(cx)
+                .picker
+                .clone()
+        });
+
+        finder_picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.preview_layout(), Some(PreviewLayout::Below));
         });
     }
 

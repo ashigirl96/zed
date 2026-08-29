@@ -1,4 +1,5 @@
-use gpui::{KeyContext, canvas};
+use gpui::{BoxShadow, KeyContext, canvas, hsla, px};
+use theme::Appearance;
 use settings::Settings;
 use theme_settings::ThemeSettings;
 use ui::{
@@ -23,6 +24,24 @@ use ui::{Divider, Tooltip, prelude::*};
 use ui_input::ErasedEditor;
 
 pub mod window_controls;
+
+fn picker_shadow(cx: &ui::App) -> Vec<BoxShadow> {
+    let is_light = cx.theme().appearance() == Appearance::Light;
+    vec![
+        BoxShadow::new(
+            px(0.),
+            px(8.),
+            hsla(0., 0., 0., if is_light { 0.14 } else { 0.36 }),
+        )
+        .blur_radius(px(24.)),
+        BoxShadow::new(
+            px(0.),
+            px(2.),
+            hsla(0., 0., 0., if is_light { 0.08 } else { 0.24 }),
+        )
+        .blur_radius(px(6.)),
+    ]
+}
 
 impl<D: PickerDelegate> Render for Picker<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -70,7 +89,16 @@ impl<D: PickerDelegate> Render for Picker<D> {
         // off.
         let has_preview = self.preview.is_some();
         let content = div()
-            .when(self.draws_own_container(), |this| this.elevation_3(cx))
+            .when(self.draws_own_container(), |this| {
+                // `elevation_3` separates the picker from what is behind it with
+                // the muted border and a shallow shadow. That reads as no edge at
+                // all over an editor, whose background is near-identical to the
+                // elevated surface, so take the stronger border and a deeper
+                // shadow instead.
+                this.elevation_3(cx)
+                    .border_color(cx.theme().colors().border)
+                    .shadow(picker_shadow(cx))
+            })
             .when(has_preview, |this| this.overflow_hidden())
             .child(content);
 

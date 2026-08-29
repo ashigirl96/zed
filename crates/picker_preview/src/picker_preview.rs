@@ -11,7 +11,7 @@ use picker::{MatchLocation, PreviewBackend, PreviewLayout, PreviewSource, Previe
 use project::{Project, Symbol};
 use rope::Point;
 use settings::Settings;
-use ui::{ActiveTheme, Color, div, prelude::*, v_flex};
+use ui::{ActiveTheme, Color, FluentBuilder as _, div, prelude::*, v_flex};
 use util::ResultExt as _;
 use util::rel_path::RelPath;
 
@@ -23,9 +23,27 @@ pub fn editor_preview(
     window: &mut Window,
     cx: &mut App,
 ) -> Arc<dyn PreviewBackend> {
-    Arc::new(EditorPreviewHandle(
-        cx.new(|cx| EditorPreview::new(project, window, cx)),
-    ))
+    Arc::new(EditorPreviewHandle(cx.new(|cx| {
+        EditorPreview::new(project, PathHeader::Hidden, window, cx)
+    })))
+}
+
+/// Like [`editor_preview`], but captioned with the previewed file's path. For
+/// pickers whose result rows don't carry the full path themselves.
+pub fn editor_preview_with_path_header(
+    project: Entity<Project>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Arc<dyn PreviewBackend> {
+    Arc::new(EditorPreviewHandle(cx.new(|cx| {
+        EditorPreview::new(project, PathHeader::Shown, window, cx)
+    })))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathHeader {
+    Shown,
+    Hidden,
 }
 
 struct EditorPreviewHandle(Entity<EditorPreview>);
@@ -56,6 +74,7 @@ struct SearchMatchLineHighlight;
 
 struct EditorPreview {
     project: Entity<Project>,
+    path_header: PathHeader,
     current_path: Option<Arc<RelPath>>,
     /// When set show a text message instead of a preview
     message: Option<HighlightedText>,
@@ -65,7 +84,12 @@ struct EditorPreview {
 }
 
 impl EditorPreview {
-    fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        project: Entity<Project>,
+        path_header: PathHeader,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let preview_editor = cx.new(|cx: &mut Context<Editor>| {
             let capability = language::Capability::ReadWrite; // Later narrowed per buffer
             let multi_buffer = cx.new(|_| MultiBuffer::without_headers(capability));
@@ -98,6 +122,7 @@ impl EditorPreview {
 
         let mut this = Self {
             project,
+            path_header,
             preview_editor,
             current_path: None,
             message: None,
@@ -316,6 +341,7 @@ impl EditorPreview {
             .size_full()
             .rounded_t_md()
             .rounded_b_md()
+            .children(self.render_path_header(cx))
             .child(self.render_message_or_editor(cx))
     }
 
@@ -323,7 +349,44 @@ impl EditorPreview {
         v_flex()
             .size_full()
             .rounded_b_md()
+            .children(self.render_path_header(cx))
             .child(self.render_message_or_editor(cx))
+    }
+
+    fn render_path_header(&self, cx: &App) -> Option<impl IntoElement> {
+        if self.path_header == PathHeader::Hidden || self.message.is_some() {
+            return None;
+        }
+        let path = self.current_path.as_ref()?;
+        let path_style = self.project.read(cx).path_style(cx);
+        let file_name = path.file_name().map(|name| name.to_string())?;
+        let directory = path
+            .parent()
+            .map(|parent| parent.display(path_style))
+            .map(SharedString::new)
+            .unwrap_or_default();
+
+        Some(
+            h_flex()
+                .flex_none()
+                .w_full()
+                .min_w_0()
+                .gap_1p5()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().elevated_surface_background)
+                .child(ui::Label::new(file_name).size(ui::LabelSize::Small))
+                .when(!directory.is_empty(), |this| {
+                    this.child(
+                        ui::Label::new(directory)
+                            .size(ui::LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate_start(),
+                    )
+                }),
+        )
     }
 
     fn render_message_or_editor(&self, cx: &App) -> impl IntoElement {

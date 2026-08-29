@@ -370,6 +370,13 @@ pub trait PickerDelegate: Sized + 'static {
         None
     }
 
+    /// The preview layout this picker prefers: used the first time it is opened
+    /// and as the target when the preview is toggled back on. Once the user
+    /// picks a layout theirs is persisted and wins over this.
+    fn default_preview_layout(&self) -> preview::Layout {
+        preview::Layout::Hidden
+    }
+
     /// Called on the delegate when opening a preview to the side. Delegates can
     /// then change how much space they use for rendering the match
     fn preview_layout_changed(&mut self, _layout_is_horizontal: bool) {}
@@ -596,7 +603,7 @@ impl<D: PickerDelegate> Picker<D> {
             preview.layout = persistence::load_last_preview_layout(D::name(), cx)
                 .log_err()
                 .flatten()
-                .unwrap_or_default();
+                .unwrap_or_else(|| delegate.default_preview_layout());
         };
         let has_preview = preview.is_some();
         let persisted_shape =
@@ -1560,7 +1567,9 @@ impl<D: PickerDelegate> Picker<D> {
         }
     }
 
-    fn preview_layout(&self) -> Option<preview::Layout> {
+    /// The layout the preview is currently in, or `None` for a picker without
+    /// a preview.
+    pub fn preview_layout(&self) -> Option<preview::Layout> {
         self.preview.as_ref().map(|p| p.layout)
     }
     fn is_auto_vertical(&self, window: &Window) -> bool {
@@ -1603,7 +1612,10 @@ impl<D: PickerDelegate> Picker<D> {
 
     fn toggle_preview_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next = match self.preview_layout() {
-            Some(preview::Layout::Hidden) | None => preview::Layout::Right,
+            Some(preview::Layout::Hidden) | None => match self.delegate.default_preview_layout() {
+                preview::Layout::Hidden => preview::Layout::Right,
+                preferred => preferred,
+            },
             Some(_) => preview::Layout::Hidden,
         };
         self.set_preview_layout(next, window, cx);
@@ -1787,8 +1799,120 @@ mod tests {
         cx.update(|cx| {
             let store = settings::SettingsStore::test(cx);
             cx.set_global(store);
+            cx.set_global(db::AppDatabase::test_new());
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
+        });
+    }
+
+    struct PrefersBelowDelegate(TestDelegate);
+
+    impl PickerDelegate for PrefersBelowDelegate {
+        type ListItem = ui::ListItem;
+
+        fn name() -> &'static str {
+            "prefers below"
+        }
+
+        fn default_preview_layout(&self) -> preview::Layout {
+            preview::Layout::Below
+        }
+
+        fn match_count(&self) -> usize {
+            self.0.match_count()
+        }
+
+        fn selected_index(&self) -> usize {
+            self.0.selected_index()
+        }
+
+        fn set_selected_index(
+            &mut self,
+            ix: usize,
+            window: &mut Window,
+            _cx: &mut Context<Picker<Self>>,
+        ) {
+            let _ = window;
+            self.0.selected_index = ix;
+        }
+
+        fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+            "Test".into()
+        }
+
+        fn update_matches(
+            &mut self,
+            _query: String,
+            _window: &mut Window,
+            _cx: &mut Context<Picker<Self>>,
+        ) -> gpui::Task<()> {
+            gpui::Task::ready(())
+        }
+
+        fn confirm(&mut self, _: bool, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
+
+        fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
+
+        fn render_match(
+            &self,
+            ix: usize,
+            selected: bool,
+            _window: &mut Window,
+            _cx: &mut Context<Picker<Self>>,
+        ) -> Option<Self::ListItem> {
+            Some(ui::ListItem::new(ix).toggle_state(selected))
+        }
+    }
+
+    struct NoopPreview;
+
+    impl preview::PreviewBackend for NoopPreview {
+        fn update(&self, _: preview::Update, _: &mut Window, _: &mut App) {}
+
+        fn render(&self, _: preview::Layout, _: &mut App) -> gpui::AnyElement {
+            gpui::Empty.into_any_element()
+        }
+
+        fn adjust_to_new_size(&self, _: &mut Window, _: &mut App) {}
+
+        fn clear(&self, _: &mut App) {}
+    }
+
+    /// Turning the preview back on must land on the layout the delegate asked
+    /// for, not the hardcoded side-by-side default.
+    #[gpui::test]
+    async fn test_toggling_preview_uses_the_delegates_preferred_layout(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            Picker::list_with_preview(
+                PrefersBelowDelegate(TestDelegate::new(vec![true])),
+                Arc::new(NoopPreview),
+                window,
+                cx,
+            )
+        });
+
+        picker.update(cx, |picker, _cx| {
+            assert_eq!(picker.preview_layout(), Some(preview::Layout::Below));
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.toggle_preview_visible(window, cx);
+        });
+        picker.update(cx, |picker, _cx| {
+            assert_eq!(picker.preview_layout(), Some(preview::Layout::Hidden));
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.toggle_preview_visible(window, cx);
+        });
+        picker.update(cx, |picker, _cx| {
+            assert_eq!(
+                picker.preview_layout(),
+                Some(preview::Layout::Below),
+                "toggling back on should return to the delegate's preferred layout"
+            );
         });
     }
 
